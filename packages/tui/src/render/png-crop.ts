@@ -110,8 +110,9 @@ export function cropPngTop(png: Uint8Array, skipRows: number): Uint8Array | null
 		[previous, current] = [current, previous];
 	}
 
-	const newHeader = header.data.slice();
-	new DataView(newHeader.buffer).setUint32(4, keptRows);
+	// Copy, not `slice()`: on a Buffer that is a view into a shared pool.
+	const newHeader = new Uint8Array(header.data);
+	new DataView(newHeader.buffer, newHeader.byteOffset, newHeader.byteLength).setUint32(4, keptRows);
 	const parts: Uint8Array[] = [PNG_SIGNATURE, writeChunk("IHDR", newHeader)];
 	for (const chunk of chunks) {
 		if (chunk.type === "IDAT") break;

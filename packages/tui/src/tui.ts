@@ -13,6 +13,7 @@
  * touch history. See `docs/tui-core-renderer.md`.
  */
 import * as fs from "node:fs";
+import { stripVTControlCharacters } from "node:util";
 import { performance } from "node:perf_hooks";
 import { getDebugLogPath } from "@oh-my-pi/pi-utils/dirs";
 import { $flag } from "@oh-my-pi/pi-utils/env";
@@ -669,6 +670,11 @@ interface PreparedLines {
 	rows: PreparedLine[];
 }
 
+/** A prepared row that shows no text: blank, or one of an image's reserved rows. */
+function isTextFreeRow(row: PreparedLine): boolean {
+	return !row.isImage && !/\S/.test(stripVTControlCharacters(row.line));
+}
+
 interface LineClassification {
 	asciiWidth: number | undefined;
 	isImage: boolean;
@@ -1002,6 +1008,12 @@ export class TUI extends Container {
 	#nextImagePlacementId = 1;
 	/** Cropped iTerm2 placements by visible lift, hidden rows and source line; a moving figure re-clips every frame. */
 	#iterm2Clips = new Map<string, string | null>();
+	/**
+	 * Text-free rows at the end of committed history. A streamed figure's
+	 * reserved rows can be committed a frame before its placement row; an
+	 * iTerm2 raster in the viewport may then still paint into them.
+	 */
+	#historyBlankTail = 0;
 	#ghosttyInitialImageDelayDone = false;
 	#ghosttyInitialImageDelayTimer: RenderTimer | undefined;
 	#ghosttyImageReadyAtMs = 0;
@@ -3287,6 +3299,9 @@ export class TUI extends Container {
 	 * Clip direct placements to their visible owner, not merely to the top of
 	 * the physical screen. A mutable image must not repaint committed history.
 	 * Raster protocols lack a delete command, so erase their covered rows first.
+	 * `blankAbove` counts committed rows directly above the owner that hold no
+	 * text: an iTerm2 raster may repaint those, since they are where its own
+	 * reserved rows went when the block's top was committed before its last row.
 	 */
 	#imageLineSequence(
 		line: string,
@@ -3294,6 +3309,7 @@ export class TUI extends Container {
 		placements: Map<number, LiveImagePlacement> | undefined,
 		placementRow: number,
 		ownerRow: number,
+		blankAbove = 0,
 	): string {
 		if (screenRow < 0) return line;
 		const parsed = parseKittyDirectPlacementLine(line);
@@ -3340,12 +3356,16 @@ export class TUI extends Container {
 						? `\x1b7\x1b[?80h${sequence}\x1b[?80l\x1b8`
 						: `\x1b7${lift + extraLift > 0 ? `\x1b[${lift + extraLift}A` : ""}${sequence}\x1b8`;
 				}
-			} else if (lift < requestedLift && TERMINAL.imageProtocol === ImageProtocol.Iterm2) {
-				// iTerm2 cannot paint above the line it lifts to or crop a placement:
-				// send only the visible rows so the raster stays where its rows are.
-				const clipped = this.#clipITerm2(line, requestedLift - lift, lift);
-				if (clipped === null) return "";
-				line = clipped;
+			} else if (requestedLift > 0 && TERMINAL.imageProtocol === ImageProtocol.Iterm2) {
+				// iTerm2 cannot paint above the screen or crop a placement: send only
+				// the rows it can reach so the raster stays where its rows are.
+				const reach = Math.min(requestedLift, screenRow, ownerRow + blankAbove);
+				if (reach < requestedLift) {
+					const clipped = this.#clipITerm2(line, requestedLift - reach, reach);
+					if (clipped === null) return "";
+					line = clipped;
+				}
+				return reach > 0 ? `\x1b[${reach}A${`${ERASE_LINE}\x1b[B`.repeat(reach)}${line}` : line;
 			} else if (lift < requestedLift && TERMINAL.imageProtocol !== ImageProtocol.Kitty) {
 				// An unknown non-Kitty raster cannot be re-anchored safely.
 				return "";
@@ -3605,12 +3625,15 @@ export class TUI extends Container {
 			this.#providerWindow = [];
 			this.#providerPreparedRows = [];
 			this.#providerHistoryWritten = false;
+			this.#historyBlankTail = 0;
 		}
 		// The viewport stays anchored directly below whatever history remains on
 		// screen. Appending K history rows moves the anchor down by K; the write
 		// scrolls only when history + viewport overflow the physical screen, and
 		// the rows that scroll off the top are exactly the oldest history rows.
 		const geometryStable = this.#hasEverRendered && this.#previousWidth === width && this.#previousHeight === height;
+		// Rows reflowed at another size no longer line up with a figure's rows.
+		if (!geometryStable) this.#historyBlankTail = 0;
 		const startTop = destructiveReset ? 0 : Math.min(this.#providerViewportTop, Math.max(0, height - 1));
 		const newTop = Math.max(0, Math.min(startTop + historyRows.length, height - rows));
 		const pendingAltExit = this.#pendingAltExit;
@@ -3674,6 +3697,29 @@ export class TUI extends Container {
 			this.#providerWindow.length > 0;
 		buffer += this.#retireImagePlacements(this.#screenImagePlacements, prepared.lines, newTop, !diffable);
 		for (const sequence of this.#imageBudget.takeTransmits()) append(sequence);
+		// iTerm2 only: how many text-free rows lead the mutable viewport, and how
+		// many text-free committed rows sit right above it once this frame's
+		// history is written. An image placed within that leading run may repaint
+		// those committed rows; see #imageLineSequence.
+		const trackBlankHistory = TERMINAL.imageProtocol === ImageProtocol.Iterm2;
+		let leadingTextFree = 0;
+		if (trackBlankHistory) {
+			while (
+				replayViewportRows + leadingTextFree < rows &&
+				isTextFreeRow(prepared.rows[replayViewportRows + leadingTextFree]!)
+			) {
+				leadingTextFree++;
+			}
+		}
+		const blankAboveOwner = (ownerRow: number): number => {
+			if (!trackBlankHistory || ownerRow > leadingTextFree) return 0;
+			let above = this.#historyBlankTail;
+			for (let index = replayViewportRows - 1; index >= 0; index--) {
+				if (!isTextFreeRow(prepared.rows[index]!)) return replayViewportRows - 1 - index;
+				above++;
+			}
+			return above;
+		};
 		const retiredImageRows = diffable
 			? this.#retiredImageRows(this.#providerPreparedRows, prepared.lines)
 			: undefined;
@@ -3697,7 +3743,11 @@ export class TUI extends Container {
 					width,
 					newTop + index,
 					this.#osc66SpacerGlyphWidth(prepared.lines, index),
-					{ imagePlacements: this.#screenImagePlacements, imageOwnerRow: index },
+					{
+						imagePlacements: this.#screenImagePlacements,
+						imageOwnerRow: index,
+						imageBlankAbove: blankAboveOwner(index),
+					},
 				)}`;
 			}
 			if (this.#providerWindow.length > rows && newTop + rows < height) {
@@ -3726,6 +3776,9 @@ export class TUI extends Container {
 						{ blankRow: compactReplay },
 					),
 				);
+				if (trackBlankHistory) {
+					this.#historyBlankTail = isTextFreeRow(preparedHistory.rows[index]!) ? this.#historyBlankTail + 1 : 0;
+				}
 				screenRow++;
 			}
 			for (let index = 0; index < rows; index++) {
@@ -3741,6 +3794,7 @@ export class TUI extends Container {
 							imagePlacements: index < replayViewportRows ? undefined : this.#screenImagePlacements,
 							imageRow: newTop + index,
 							imageOwnerRow: index < replayViewportRows ? undefined : index - replayViewportRows,
+							imageBlankAbove: index < replayViewportRows ? undefined : blankAboveOwner(index - replayViewportRows),
 						},
 					),
 				);
@@ -3748,6 +3802,8 @@ export class TUI extends Container {
 			}
 			if (newTop + rows < height) buffer += `\x1b[${newTop + rows + 1};1H\x1b[J`;
 		}
+		// Replay rows moved into the viewport sit above the mutable top from now on.
+		if (trackBlankHistory && replayViewportRows > 0) this.#historyBlankTail = blankAboveOwner(0);
 		const mutableTop = newTop + replayViewportRows;
 		const mutablePreparedLines = replayViewportRows > 0 ? prepared.lines.slice(replayViewportRows) : prepared.lines;
 		const mutablePreparedRows = replayViewportRows > 0 ? prepared.rows.slice(replayViewportRows) : prepared.rows;
@@ -4384,6 +4440,8 @@ export class TUI extends Container {
 			imageRow?: number;
 			/** Row within this image's owner, not the physical screen. */
 			imageOwnerRow?: number;
+			/** Text-free committed rows directly above the owner's top; see {@link #imageLineSequence}. */
+			imageBlankAbove?: number;
 		},
 	): string {
 		// End every rewrite at column zero. ConPTY can materialize a pending
@@ -4409,6 +4467,7 @@ export class TUI extends Container {
 					options?.imagePlacements,
 					options?.imageRow ?? screenRow,
 					options?.imageOwnerRow ?? screenRow,
+					options?.imageBlankAbove,
 				);
 		} else {
 			const terminalLine = this.#terminalLine(line);
