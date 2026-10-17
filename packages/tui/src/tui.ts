@@ -49,6 +49,7 @@ import {
 } from "./terminal-capabilities";
 import { compositeLineAt } from "./render/composite";
 import { clipSixel } from "./render/sixel";
+import { cropPngTop } from "./render/png-crop";
 import { tmuxMultiplexer } from "./multiplexers/tmux";
 import {
 	Ellipsis,
@@ -999,6 +1000,8 @@ export class TUI extends Container {
 	#screenImagePlacements = new Map<number, LiveImagePlacement>();
 	#altImagePlacements = new Map<number, LiveImagePlacement>();
 	#nextImagePlacementId = 1;
+	/** Cropped iTerm2 placements by visible lift, hidden rows and source line; a moving figure re-clips every frame. */
+	#iterm2Clips = new Map<string, string | null>();
 	#ghosttyInitialImageDelayDone = false;
 	#ghosttyInitialImageDelayTimer: RenderTimer | undefined;
 	#ghosttyImageReadyAtMs = 0;
@@ -3253,6 +3256,34 @@ export class TUI extends Container {
 	}
 
 	/**
+	 * An iTerm2 placement line with its top `hiddenRows` rows cut out of the
+	 * PNG and lifted only `lift` rows, or `null` when the line or image cannot
+	 * be rewritten. The image keeps its scale: the hidden rows are measured in
+	 * the source pixels that one cell row shows at the placement's width.
+	 */
+	#clipITerm2(line: string, hiddenRows: number, lift: number): string | null {
+		const key = `${hiddenRows};${lift};${line}`;
+		const cached = this.#iterm2Clips.get(key);
+		if (cached !== undefined) return cached;
+		let clipped: string | null = null;
+		const match = /^\x1b7\x1b\[\d+A\x1b\]1337;File=([^:\x07]*):([A-Za-z0-9+/=]+)\x07\x1b8$/.exec(line);
+		const columns = Number(match && /(?:^|;)width=(\d+)(?:;|$)/.exec(match[1])?.[1]);
+		const cell = getCellDimensions();
+		if (match && columns > 0 && cell.widthPx > 0 && cell.heightPx > 0) {
+			const png = Buffer.from(match[2], "base64");
+			const sourceWidth = png.byteLength >= 24 ? png.readUInt32BE(16) : 0;
+			const sourceRowsPerCell = (cell.heightPx * sourceWidth) / (columns * cell.widthPx);
+			const cropped = sourceWidth > 0 ? cropPngTop(png, Math.round(hiddenRows * sourceRowsPerCell)) : null;
+			if (cropped) {
+				clipped = `\x1b7${lift > 0 ? `\x1b[${lift}A` : ""}\x1b]1337;File=${match[1]}:${cropped.toBase64()}\x07\x1b8`;
+			}
+		}
+		if (this.#iterm2Clips.size >= 16) this.#iterm2Clips.delete(this.#iterm2Clips.keys().next().value!);
+		this.#iterm2Clips.set(key, clipped);
+		return clipped;
+	}
+
+	/**
 	 * Clip direct placements to their visible owner, not merely to the top of
 	 * the physical screen. A mutable image must not repaint committed history.
 	 * Raster protocols lack a delete command, so erase their covered rows first.
@@ -3309,6 +3340,12 @@ export class TUI extends Container {
 						? `\x1b7\x1b[?80h${sequence}\x1b[?80l\x1b8`
 						: `\x1b7${lift + extraLift > 0 ? `\x1b[${lift + extraLift}A` : ""}${sequence}\x1b8`;
 				}
+			} else if (lift < requestedLift && TERMINAL.imageProtocol === ImageProtocol.Iterm2) {
+				// iTerm2 cannot paint above the line it lifts to or crop a placement:
+				// send only the visible rows so the raster stays where its rows are.
+				const clipped = this.#clipITerm2(line, requestedLift - lift, lift);
+				if (clipped === null) return "";
+				line = clipped;
 			} else if (lift < requestedLift && TERMINAL.imageProtocol !== ImageProtocol.Kitty) {
 				// An unknown non-Kitty raster cannot be re-anchored safely.
 				return "";
