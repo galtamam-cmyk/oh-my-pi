@@ -431,6 +431,18 @@ fn ensure_not_cancelled(params: &ExecutionParameters) -> Result<(), error::Error
 	Ok(())
 }
 
+/// Per-iteration check for loops: stop when cancelled, and give the runtime
+/// worker back once the task's cooperative budget runs out. A loop body of
+/// synchronous builtins (`while :; do :; done`) never awaits anything that
+/// pends, so without the yield a backgrounded loop holds its worker until it
+/// ends: `abort()` of its job never lands, and enough such jobs stall every
+/// task on the shared runtime, including timers and later shell runs.
+async fn loop_iteration_checkpoint(params: &ExecutionParameters) -> Result<(), error::Error> {
+	ensure_not_cancelled(params)?;
+	tokio::task::consume_budget().await;
+	Ok(())
+}
+
 
 #[derive(Clone, Debug, Default)]
 /// Policy for how to manage spawned external processes.
@@ -1390,7 +1402,7 @@ impl Execute for ast::ForClauseCommand {
 		}
 
 		for value in expanded_values {
-			ensure_not_cancelled(params)?;
+			loop_iteration_checkpoint(params).await?;
 			if shell.options().print_commands_and_arguments {
 				if let Some(unexpanded_values) = &self.values {
 					shell
@@ -1584,7 +1596,7 @@ impl Execute for (WhileOrUntil, &ast::WhileOrUntilClauseCommand) {
 		condition_params.suppress_errexit = true;
 
 		loop {
-			ensure_not_cancelled(params)?;
+			loop_iteration_checkpoint(params).await?;
 			let condition_result = test_condition.execute(shell, &condition_params).await?;
 
 			// Update status for condition
@@ -1657,7 +1669,7 @@ impl Execute for ast::ArithmeticForClauseCommand {
 		}
 
 		loop {
-			ensure_not_cancelled(params)?;
+			loop_iteration_checkpoint(params).await?;
 			if let Some(condition) = &self.condition {
 				// An empty condition (e.g., `for (( ; ; ))`) means "always true".
 				if !condition.value.is_empty() && condition.eval(shell, params, true).await? == 0 {

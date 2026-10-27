@@ -6814,6 +6814,100 @@ replace = [{ pattern = "hello", replacement = "HI" }]
 		assert!(!still_written(output.path()).await, "kill %1 did not end the compound loop");
 	}
 
+	/// Runs `body` on its own runtime with `workers` worker threads and fails if
+	/// it has not finished within `limit`. The bound is kept from this thread,
+	/// not with a runtime timer, because a task holding every worker also stops
+	/// that runtime's timers.
+	fn on_dedicated_runtime<F, Fut>(workers: usize, limit: Duration, body: F)
+	where
+		F: FnOnce() -> Fut + Send + 'static,
+		Fut: Future<Output = ()>,
+	{
+		let (done_tx, done_rx) = std::sync::mpsc::channel();
+		std::thread::spawn(move || {
+			let runtime = tokio::runtime::Builder::new_multi_thread()
+				.worker_threads(workers)
+				.enable_all()
+				.build()
+				.expect("build runtime");
+			let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+				runtime.block_on(body());
+			}));
+			let _ = done_tx.send(outcome);
+			// A task that never yields would block a waiting shutdown forever.
+			runtime.shutdown_background();
+		});
+		match done_rx.recv_timeout(limit) {
+			Ok(Ok(())) => {},
+			Ok(Err(panic)) => std::panic::resume_unwind(panic),
+			Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+				panic!("runtime stalled for {limit:?}: a task is holding its workers")
+			},
+			Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+				panic!("the runtime thread exited without reporting an outcome")
+			},
+		}
+	}
+
+	/// A backgrounded loop of synchronous builtins shares its runtime worker:
+	/// with a single worker, later runs in the session still complete while the
+	/// loop spins, and `kill %1` can reach it.
+	#[test]
+	fn background_builtin_loop_leaves_the_runtime_to_later_runs() {
+		on_dedicated_runtime(1, Duration::from_secs(30), || async {
+			let _guard = shell_test_lock().lock().await;
+			let shell = Shell::new(None);
+			let run = |command: &str| {
+				shell.run(
+					ShellRunOptions { command: command.into(), ..Default::default() },
+					None,
+					CancelToken::default(),
+				)
+			};
+
+			run("(while :; do :; done) &")
+				.await
+				.expect("background the loop");
+			let echo = run("echo ok").await.expect("run beside the loop");
+			assert_eq!(echo.exit_code, Some(0), "echo failed beside the loop");
+			let kill = run("kill %1").await.expect("kill %1");
+			assert_eq!(kill.exit_code, Some(0), "kill %1 failed");
+		});
+	}
+
+	/// Dropping a session ends its backgrounded loop of synchronous builtins.
+	/// The job's task is aborted on drop, and the abort lands only where the
+	/// loop yields; before it did, the loop spun for the life of the host with
+	/// no job table or process left to stop it.
+	#[test]
+	fn dropping_the_session_ends_its_background_builtin_loop() {
+		on_dedicated_runtime(2, Duration::from_secs(30), || async {
+			let _guard = shell_test_lock().lock().await;
+			let metrics = tokio::runtime::Handle::current().metrics();
+			let baseline = metrics.num_alive_tasks();
+			let shell = Shell::new(None);
+			shell
+				.run(
+					ShellRunOptions { command: "(while :; do :; done) &".into(), ..Default::default() },
+					None,
+					CancelToken::default(),
+				)
+				.await
+				.expect("background the loop");
+			assert!(metrics.num_alive_tasks() > baseline, "the background loop is not running");
+
+			drop(shell);
+			let deadline = time::Instant::now() + Duration::from_secs(5);
+			while metrics.num_alive_tasks() > baseline {
+				assert!(
+					time::Instant::now() < deadline,
+					"the background loop outlived its dropped session"
+				);
+				time::sleep(Duration::from_millis(20)).await;
+			}
+		});
+	}
+
 	/// `live_background_job_count` reports 0 when the session has no live
 	/// external background jobs and 1 while one is running. The host relies on
 	/// this to retain a per-call shell whose `&`/`nohup` child is still alive

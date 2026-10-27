@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed a backgrounded loop of shell built-ins, such as `(while :; do :; done) &`, keeping a core busy after its shell session was gone and, with several running, stalling every later bash call until restart ([#10549](https://github.com/can1357/oh-my-pi/issues/10549))
+
 ## [18.13.2] - 2026-10-27
 
 ### Added
